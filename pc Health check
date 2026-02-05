@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/hardware_inventory_health_checker.py b/hardware_inventory_health_checker.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..9324da6e7dd7c8064d713d4259224e480e29687b
@@ -413,6 +412,3 @@ index 0000000000000000000000000000000000000000..9324da6e7dd7c8064d713d4259224e48
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
- 
-EOF
-)
