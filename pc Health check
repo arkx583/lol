@@ -1,0 +1,418 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/hardware_inventory_health_checker.py b/hardware_inventory_health_checker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9324da6e7dd7c8064d713d4259224e480e29687b
+--- /dev/null
++++ b/hardware_inventory_health_checker.py
+@@ -0,0 +1,408 @@
++#!/usr/bin/env python3
++"""PC Hardware Inventory & Health Checker.
++
++Scans system info (CPU, RAM, GPU, temperatures, storage health) and exports
++clean JSON and/or HTML reports.
++"""
++
++from __future__ import annotations
++
++import argparse
++import datetime as dt
++import html
++import json
++import os
++import platform
++import re
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any
++
++
++def run_command(command: list[str]) -> str:
++    """Return stdout for a command, or empty string on failure."""
++    try:
++        completed = subprocess.run(
++            command,
++            check=False,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++            timeout=8,
++        )
++        return (completed.stdout or "").strip()
++    except Exception:
++        return ""
++
++
++def try_import_psutil():
++    try:
++        import psutil  # type: ignore
++
++        return psutil
++    except Exception:
++        return None
++
++
++def collect_cpu_info(psutil_mod) -> dict[str, Any]:
++    cpu: dict[str, Any] = {
++        "model": platform.processor() or "Unknown",
++        "architecture": platform.machine(),
++        "physical_cores": os.cpu_count(),
++        "logical_cores": os.cpu_count(),
++        "frequency_mhz": None,
++        "usage_percent": None,
++    }
++
++    if sys.platform.startswith("linux"):
++        cpuinfo = run_command(["bash", "-lc", "cat /proc/cpuinfo"])
++        model_match = re.search(r"model name\s*:\s*(.+)", cpuinfo)
++        if model_match:
++            cpu["model"] = model_match.group(1).strip()
++
++    if psutil_mod:
++        try:
++            cpu["physical_cores"] = psutil_mod.cpu_count(logical=False)
++            cpu["logical_cores"] = psutil_mod.cpu_count(logical=True)
++            freq = psutil_mod.cpu_freq()
++            if freq:
++                cpu["frequency_mhz"] = round(freq.current, 2)
++            cpu["usage_percent"] = psutil_mod.cpu_percent(interval=0.4)
++        except Exception:
++            pass
++
++    return cpu
++
++
++def collect_ram_info(psutil_mod) -> dict[str, Any]:
++    ram = {
++        "total_gb": None,
++        "used_gb": None,
++        "available_gb": None,
++        "usage_percent": None,
++    }
++
++    if psutil_mod:
++        try:
++            vm = psutil_mod.virtual_memory()
++            ram.update(
++                {
++                    "total_gb": round(vm.total / (1024**3), 2),
++                    "used_gb": round(vm.used / (1024**3), 2),
++                    "available_gb": round(vm.available / (1024**3), 2),
++                    "usage_percent": vm.percent,
++                }
++            )
++            return ram
++        except Exception:
++            pass
++
++    if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
++        try:
++            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
++            ram["total_gb"] = round(total / (1024**3), 2)
++        except Exception:
++            pass
++
++    return ram
++
++
++def collect_gpu_info() -> list[dict[str, Any]]:
++    gpus: list[dict[str, Any]] = []
++
++    nvidia_smi = shutil.which("nvidia-smi")
++    if nvidia_smi:
++        output = run_command(
++            [
++                nvidia_smi,
++                "--query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version",
++                "--format=csv,noheader,nounits",
++            ]
++        )
++        for line in output.splitlines():
++            parts = [p.strip() for p in line.split(",")]
++            if len(parts) >= 6:
++                gpus.append(
++                    {
++                        "name": parts[0],
++                        "memory_total_mb": safe_num(parts[1]),
++                        "memory_used_mb": safe_num(parts[2]),
++                        "temperature_c": safe_num(parts[3]),
++                        "utilization_percent": safe_num(parts[4]),
++                        "driver_version": parts[5],
++                    }
++                )
++
++    if gpus:
++        return gpus
++
++    if sys.platform.startswith("linux"):
++        lspci = run_command(["lspci"])
++        for line in lspci.splitlines():
++            if "vga" in line.lower() or "3d controller" in line.lower():
++                gpus.append({"name": line.split(":", 2)[-1].strip()})
++
++    elif sys.platform == "darwin":
++        sp = run_command(["system_profiler", "SPDisplaysDataType"])
++        for match in re.finditer(r"Chipset Model:\s*(.+)", sp):
++            gpus.append({"name": match.group(1).strip()})
++
++    elif os.name == "nt":
++        wmic = run_command(["wmic", "path", "win32_VideoController", "get", "name"])
++        for line in wmic.splitlines()[1:]:
++            line = line.strip()
++            if line:
++                gpus.append({"name": line})
++
++    return gpus
++
++
++def collect_temperature_info(psutil_mod) -> list[dict[str, Any]]:
++    temps: list[dict[str, Any]] = []
++
++    if psutil_mod:
++        try:
++            sensor_data = psutil_mod.sensors_temperatures(fahrenheit=False)
++            for sensor, entries in sensor_data.items():
++                for entry in entries:
++                    temps.append(
++                        {
++                            "sensor": sensor,
++                            "label": entry.label or "N/A",
++                            "current_c": entry.current,
++                            "high_c": entry.high,
++                            "critical_c": entry.critical,
++                        }
++                    )
++        except Exception:
++            pass
++
++    if not temps and shutil.which("nvidia-smi"):
++        output = run_command(
++            [
++                "nvidia-smi",
++                "--query-gpu=name,temperature.gpu",
++                "--format=csv,noheader,nounits",
++            ]
++        )
++        for line in output.splitlines():
++            parts = [p.strip() for p in line.split(",")]
++            if len(parts) == 2:
++                temps.append(
++                    {
++                        "sensor": "nvidia_gpu",
++                        "label": parts[0],
++                        "current_c": safe_num(parts[1]),
++                        "high_c": None,
++                        "critical_c": None,
++                    }
++                )
++
++    return temps
++
++
++def collect_storage_info(psutil_mod) -> list[dict[str, Any]]:
++    disks: list[dict[str, Any]] = []
++
++    if psutil_mod:
++        try:
++            partitions = psutil_mod.disk_partitions(all=False)
++            for p in partitions:
++                if not p.fstype:
++                    continue
++                usage = psutil_mod.disk_usage(p.mountpoint)
++                disks.append(
++                    {
++                        "device": p.device,
++                        "mountpoint": p.mountpoint,
++                        "filesystem": p.fstype,
++                        "total_gb": round(usage.total / (1024**3), 2),
++                        "used_gb": round(usage.used / (1024**3), 2),
++                        "free_gb": round(usage.free / (1024**3), 2),
++                        "usage_percent": usage.percent,
++                        "smart_health": get_smart_health(p.device),
++                    }
++                )
++            return dedupe_disks(disks)
++        except Exception:
++            pass
++
++    df = run_command(["df", "-h"])
++    for line in df.splitlines()[1:]:
++        cols = line.split()
++        if len(cols) >= 6:
++            disks.append(
++                {
++                    "device": cols[0],
++                    "mountpoint": cols[5],
++                    "filesystem": "unknown",
++                    "total": cols[1],
++                    "used": cols[2],
++                    "available": cols[3],
++                    "usage_percent": cols[4],
++                    "smart_health": get_smart_health(cols[0]),
++                }
++            )
++
++    return dedupe_disks(disks)
++
++
++def dedupe_disks(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    seen: set[tuple[str, str]] = set()
++    deduped = []
++    for disk in disks:
++        key = (str(disk.get("device")), str(disk.get("mountpoint")))
++        if key in seen:
++            continue
++        seen.add(key)
++        deduped.append(disk)
++    return deduped
++
++
++def get_smart_health(device: str) -> str:
++    smartctl = shutil.which("smartctl")
++    if not smartctl:
++        return "smartctl not available"
++
++    dev = normalize_device_for_smartctl(device)
++    output = run_command([smartctl, "-H", dev])
++    if not output:
++        return "unknown"
++
++    for line in output.splitlines():
++        l = line.lower()
++        if "overall-health self-assessment test result" in l or "smart overall-health self-assessment test result" in l:
++            return line.split(":", 1)[-1].strip()
++        if "smart health status" in l:
++            return line.split(":", 1)[-1].strip()
++
++    return "unknown"
++
++
++def normalize_device_for_smartctl(device: str) -> str:
++    if sys.platform.startswith("linux"):
++        mapped = re.sub(r"p?\d+$", "", device)
++        mapped = mapped.replace("/mapper/", "/")
++        if mapped.startswith("/dev/"):
++            return mapped
++    return device
++
++
++def safe_num(value: str) -> float | int | str:
++    try:
++        f = float(value)
++        return int(f) if f.is_integer() else f
++    except Exception:
++        return value
++
++
++def generate_report() -> dict[str, Any]:
++    psutil_mod = try_import_psutil()
++    return {
++        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
++        "host": {
++            "hostname": platform.node(),
++            "os": platform.platform(),
++            "python": platform.python_version(),
++        },
++        "cpu": collect_cpu_info(psutil_mod),
++        "ram": collect_ram_info(psutil_mod),
++        "gpu": collect_gpu_info(),
++        "temperatures": collect_temperature_info(psutil_mod),
++        "storage": collect_storage_info(psutil_mod),
++    }
++
++
++def html_from_report(report: dict[str, Any]) -> str:
++    def pretty(obj: Any) -> str:
++        return html.escape(json.dumps(obj, indent=2, ensure_ascii=False))
++
++    rows = []
++    for key in ["host", "cpu", "ram", "gpu", "temperatures", "storage"]:
++        rows.append(
++            f"""
++            <section class=\"card\">
++              <h2>{html.escape(key.replace('_', ' ').title())}</h2>
++              <pre>{pretty(report.get(key, {}))}</pre>
++            </section>
++            """
++        )
++
++    return f"""<!DOCTYPE html>
++<html lang=\"en\">
++<head>
++  <meta charset=\"UTF-8\" />
++  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
++  <title>Hardware Inventory & Health Report</title>
++  <style>
++    :root {{ color-scheme: light dark; }}
++    body {{ font-family: Inter, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem auto; max-width: 980px; padding: 0 1rem; background: #0b1020; color: #e5e7eb; }}
++    h1 {{ margin-bottom: .25rem; }}
++    .meta {{ color: #9ca3af; margin-bottom: 1.25rem; }}
++    .grid {{ display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }}
++    .card {{ border: 1px solid #334155; border-radius: 12px; background: #111827; padding: 1rem; }}
++    h2 {{ margin-top: 0; font-size: 1.05rem; color: #93c5fd; }}
++    pre {{ white-space: pre-wrap; word-break: break-word; font-size: .87rem; line-height: 1.35; margin: 0; }}
++  </style>
++</head>
++<body>
++  <h1>PC Hardware Inventory & Health Checker</h1>
++  <p class=\"meta\">Generated at {html.escape(report.get('generated_at', 'unknown'))}</p>
++  <div class=\"grid\">
++    {''.join(rows)}
++  </div>
++</body>
++</html>
++"""
++
++
++def export_report(report: dict[str, Any], output_dir: Path, fmt: str) -> list[Path]:
++    output_dir.mkdir(parents=True, exist_ok=True)
++    created: list[Path] = []
++
++    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
++    if fmt in {"json", "both"}:
++        json_path = output_dir / f"hardware_report_{timestamp}.json"
++        json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
++        created.append(json_path)
++
++    if fmt in {"html", "both"}:
++        html_path = output_dir / f"hardware_report_{timestamp}.html"
++        html_path.write_text(html_from_report(report), encoding="utf-8")
++        created.append(html_path)
++
++    return created
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="PC Hardware Inventory & Health Checker")
++    parser.add_argument(
++        "--format",
++        choices=["json", "html", "both"],
++        default="both",
++        help="Output format",
++    )
++    parser.add_argument(
++        "--output-dir",
++        default="reports",
++        help="Directory where reports will be written",
++    )
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    report = generate_report()
++    files = export_report(report, Path(args.output_dir), args.format)
++
++    print("Generated report files:")
++    for f in files:
++        print(f" - {f}")
++
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+ 
+EOF
+)
